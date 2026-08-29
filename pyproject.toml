@@ -1,7 +1,11 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
 [project]
-name = "alignment"
+name = "RL framework"
 version = "1.0.0"
-description = "CS 336 Spring 2026 Assignment 5: Reasoning RL"
+description = "My everyday personal reinforcement learning framework"
 readme = "README.md"
 requires-python = ">=3.12,<3.13"  # Python 3.13 not yet supported for some deps
 dependencies = [
@@ -28,7 +32,7 @@ plots = [
 ]
 
 [tool.setuptools.packages.find]
-include = ["cs336_alignment*"]
+include = ["experiment*", "utils*"]
 
 [tool.uv]
 package = true

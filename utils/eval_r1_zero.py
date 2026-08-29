@@ -1,5 +1,5 @@
-import vllm_utils as vllm
-import drgrpo_grader as grader
+from utils import drgrpo_grader as grader
+from utils import vllm_utils as vllm
 import json
 from pathlib import Path
 import re
@@ -11,9 +11,12 @@ def extract_ground_truth(answer: str) -> str|None:
         return None
     return match.group(1).strip()
 
-PROMPT_PATH = Path(__file__).resolve().parent.parent / "prompts" / "r1_zero.prompt"
-DATA_PATH = Path(__file__).resolve().parent.parent.parent / "data" / "gsm8k" / "train.jsonl"
-RESULT_PATH = Path(__file__).resolve().parent / "results" / "r1_zero_gsm8k_base_eval.jsonl"
+# All paths are resolved from the repository root, not from ``utils/``.  This
+# keeps the script usable when launched as ``python utils/eval_r1_zero.py``.
+REPO_ROOT = Path(__file__).resolve().parent.parent
+PROMPT_PATH = REPO_ROOT / "prompts" / "r1_zero.prompt"
+DATA_PATH = REPO_ROOT / "data" / "gsm8k" / "train.jsonl"
+RESULT_PATH = REPO_ROOT / "results" / "eval result" / "r1_zero_gsm8k_base_eval.jsonl"
 RESULT_PATH.parent.mkdir(parents=True, exist_ok=True)
 
 batch_size = 16
