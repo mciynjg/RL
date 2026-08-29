@@ -26,6 +26,8 @@ max_grad_norm = 1.0
 model_name = "allenai/OLMo-2-0425-1B"
 advantage_algorithm = "GRPO"
 
+helper.seed_everything(seed=seed)
+
 if advantage_algorithm == "GRPO":
     baseline = "mean"
     advantage_normalizer = "std"
@@ -51,6 +53,9 @@ elif advantage_algorithm == "MaxRL":
     advantage_normalizer = "mean"
     loss_normalization = "constant"
     normalization_constant = rollout_batch_size*sampling_max_tokens
+
+else:
+    raise NotImplementedError
     
 
 wandb_project = "RL"

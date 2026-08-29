@@ -4,7 +4,26 @@ from transformers import PreTrainedTokenizerBase,PreTrainedModel
 from typing import Callable,Literal,List,Tuple
 import random
 import re
+import os
+import numpy as np
+def seed_everything(seed: int) -> None:
+    os.environ["PYTHONHASHSEED"] = str(seed)
 
+    random.seed(seed)
+    np.random.seed(seed)
+
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+
+    # cuDNN 设置
+    torch.backends.cudnn.benchmark = False
+    torch.backends.cudnn.deterministic = True
+
+    # 使用确定性算法；遇到不支持的算子时直接报错
+    torch.use_deterministic_algorithms(True)
+      
 def extract_ground_truth(answer: str) -> str|None:
     match = re.search(r"####\s*(.*)", answer)
     if match is None:
