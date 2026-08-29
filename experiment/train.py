@@ -2,7 +2,7 @@ import utils.helper as helper
 import torch
 from pathlib import Path
 import utils.vllm_utils as vllm
-import utils.drgrpo_grader as grader
+import utils.grader as grader
 import json
 import wandb
 import random
