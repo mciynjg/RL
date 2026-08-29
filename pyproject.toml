@@ -3,7 +3,7 @@ requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "RL framework"
+name = "rl-framework"
 version = "1.0.0"
 description = "My everyday personal reinforcement learning framework"
 readme = "README.md"
@@ -19,6 +19,8 @@ dependencies = [
     "pytest>=8.3.5",
     "pylatexenc>=2.10",
     "torch",
+    "torchaudio==2.10.0 ; sys_platform == 'linux' and platform_machine == 'x86_64'",
+    "torchvision==0.25.0 ; sys_platform == 'linux' and platform_machine == 'x86_64'",
     "transformers>=4.50.0",
     "typer>=0.15.4",
     "vllm==0.19.1 ; sys_platform == 'linux' and platform_machine == 'x86_64'",
@@ -45,6 +47,12 @@ environments = [
 [tool.uv.sources]
 torch = [
     { index = "pytorch-cu129", marker = "sys_platform == 'linux'" },
+]
+torchaudio = [
+    { index = "pytorch-cu129", marker = "sys_platform == 'linux' and platform_machine == 'x86_64'" },
+]
+torchvision = [
+    { index = "pytorch-cu129", marker = "sys_platform == 'linux' and platform_machine == 'x86_64'" },
 ]
 [[tool.uv.index]]
 name = "pytorch-cu129"
