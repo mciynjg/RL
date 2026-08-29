@@ -55,3 +55,6 @@ explicit = true
 log_cli = true
 log_cli_level = "WARNING"
 testpaths = ["tests"]
+markers = [
+    "e2e: opt-in tests that load a model and start a real vLLM server",
+]

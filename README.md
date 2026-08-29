@@ -183,6 +183,22 @@ uv run pytest -q
 
 测试中的 vLLM 请求使用本地替身拦截网络边界，不会访问真实服务。本次新增测试时未执行 pytest。
 
+另有一个默认跳过的真实端到端测试 `tests/test_e2e.py`，会加载一个很小的 Hugging Face 模型，启动
+vLLM 服务，生成一条 completion 后关闭服务。需要 CUDA、模型下载和可用显存；显式开启后运行：
+
+```bash
+RUN_E2E=1 E2E_GPU=0 uv run pytest -q tests/test_e2e.py -m e2e
+```
+
+默认模型是 `HuggingFaceTB/SmolLM2-135M`，可通过 `E2E_MODEL_ID` 替换。例如：
+
+```bash
+RUN_E2E=1 E2E_MODEL_ID=HuggingFaceTB/SmolLM2-135M E2E_GPU=0 \
+  uv run pytest -q tests/test_e2e.py -m e2e
+```
+
+该测试默认不运行，以免普通 smoke 测试意外下载模型或占用 GPU。
+
 ## 已知问题
 
 1. 验证期间的最佳模型保存发生在验证 batch 循环内部，可能重复写入大 checkpoint；同时它会
