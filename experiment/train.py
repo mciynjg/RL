@@ -245,7 +245,7 @@ for step in range(0,num_rollout_steps):
         val_batch_size = 64
         val_sampling_params = sampling_params.copy()
         val_sampling_params["n"] = 1
-        val_sampling_params["temperature"] = 0.0  # Greedy
+        val_sampling_params["temperature"] = 0.0  
         
         for i in range(0, n_val_examples, val_batch_size):
             batch_val_prompts = val_prompts[i:i+val_batch_size]
