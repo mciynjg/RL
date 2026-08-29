@@ -118,18 +118,28 @@ with open(PROMPT_PATH, "r", encoding="utf-8") as f:
     
 
 with open(TRAIN_SET_PATH, "r", encoding="utf-8") as f:
-    for i,line in enumerate(f):
-        if i >=n_train_examples:
-            break
-        data = json.loads(line)
-        prompt = prompt_template.format(question = data["question"])
+    train_examples = [json.loads(line) for line in f if line.strip()]
+
+if not train_examples:
+    raise ValueError(f"No training examples found in {TRAIN_SET_PATH}")
+
+# The local dataset can be smaller than n_train_examples. Sample complete,
+# independently shuffled passes over it until the requested size is reached.
+sampling_rng = random.Random(seed)
+while len(prompts) < n_train_examples:
+    epoch_examples = train_examples.copy()
+    sampling_rng.shuffle(epoch_examples)
+    remaining = n_train_examples - len(prompts)
+    for data in epoch_examples[:remaining]:
+        prompt = prompt_template.format(question=data["question"])
         prompts.append(prompt)
         groundtruths.append(helper.extract_ground_truth(data["answer"]))
 
 val_prompts, val_groundtruths = [], []
 with open(VALID_SET_PATH, "r", encoding="utf-8") as f:
     for i, line in enumerate(f):
-        if i >= n_val_examples: break
+        if i >= n_val_examples:
+            break
         data = json.loads(line)
         val_prompts.append(prompt_template.format(question=data["question"]))
         val_groundtruths.append(helper.extract_ground_truth(data["answer"]))

@@ -283,6 +283,9 @@ def grpo_train_step(
         mask = raw_rewards!=0.0
         pruned_raw_rewards = raw_rewards[mask]
     num_pruned_rollout = len(pruned_raw_rewards)
+
+    if num_pruned_rollout == 0:
+        return (metadata["loss"],metadata)
     inputs = inputs[mask]
     labels = labels[mask]
     response_mask = response_mask[mask]
@@ -363,4 +366,3 @@ def grpo_train_step(
     optimizer.zero_grad()
     
     return (metadata["loss"],metadata)
-

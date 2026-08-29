@@ -85,7 +85,7 @@ export WANDB_MODE=offline
 | `gradient_accumulation_steps` | `32` | 用于切分训练 microbatch |
 | `sampling_max_tokens` | `512` | 单条回答的最大生成 token 数 |
 | `num_rollout_steps` | `200` | rollout/更新轮数 |
-| `n_train_examples` | `6400` | 计划使用的训练问题数 |
+| `n_train_examples` | `6400` | 训练采样数；数据不足时按随机重排后的 epoch 循环取样 |
 | `n_val_examples` | `1024` | 使用的验证问题数 |
 
 算法名称对应的归一化设置如下：
@@ -162,6 +162,8 @@ uv run python utils/eval_rl_three_shot.py
 ```
 
 标准答案通过 `####` 后的内容提取。请在使用或分发仓库内各数据集时遵守对应数据集的原始许可。
+当 `n_train_examples` 大于训练集行数时，训练入口会以 `seed` 为随机种子重复打乱数据集，按多个
+epoch 继续采样，直至达到指定数量；单个 epoch 内不会重复采样。
 
 ## 检查与测试
 
@@ -175,14 +177,10 @@ uv run python -m compileall -q experiment utils
 
 ## 已知问题
 
-1. `n_train_examples=6400`，但本地训练集只有 1,421 条。当前循环不会自动跨 epoch
-   重排或停止，大约第 45 步会产生空 batch 并报错；运行前需要缩短步数或实现循环采样。
-2. 当一个训练 batch 中所有 group 都被过滤时，`microbatch_size` 会变成 0，随后
-   `range(..., step=0)` 报错。训练步骤需要对“无有效 rollout”单独处理。
-3. 验证期间的最佳模型保存发生在验证 batch 循环内部，可能重复写入大 checkpoint；同时它会
+1. 验证期间的最佳模型保存发生在验证 batch 循环内部，可能重复写入大 checkpoint；同时它会
    删除之前保存到同一目录的 tokenizer，最终目录可能只有模型权重。
-4. GPU、端口、模型和实验参数均为硬编码，且没有配置校验；未知的算法名会导致变量未初始化。
-5. 仓库没有自动化测试。数学判分器还包含多处裸 `except` 和非 raw regex 字符串，可能掩盖异常，
+2. GPU、端口、模型和实验参数均为硬编码，且没有配置校验；未知的算法名会导致变量未初始化。
+3. 仓库没有自动化测试。数学判分器还包含多处裸 `except` 和非 raw regex 字符串，可能掩盖异常，
    并会在新版 Python 中产生无效转义警告。
 
 ## 结果复现提示
