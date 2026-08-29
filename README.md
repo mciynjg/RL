@@ -173,20 +173,39 @@ epoch 继续采样，直至达到指定数量；单个 epoch 内不会重复采�
 uv run python -m compileall -q experiment utils
 ```
 
-项目配置了 pytest，但当前仓库还没有 `tests/` 下的测试文件，因此 `pytest` 暂时不能提供训练逻辑的回归保障。
+`tests/test_smoke.py` 提供一组不下载模型、不启动 vLLM 服务的 CPU smoke 测试，覆盖包导入、
+GSM8K/prompt 读取、随机种子、tokenization、reward/advantage/loss、微型策略的一次训练更新、数学
+判分和 vLLM HTTP completion 适配。运行方式：
+
+```bash
+uv run pytest -q
+```
+
+测试中的 vLLM 请求使用本地替身拦截网络边界，不会访问真实服务。本次新增测试时未执行 pytest。
 
 ## 已知问题
 
 1. 验证期间的最佳模型保存发生在验证 batch 循环内部，可能重复写入大 checkpoint；同时它会
    删除之前保存到同一目录的 tokenizer，最终目录可能只有模型权重。
 2. GPU、端口、模型和实验参数均为硬编码，且没有配置校验；未知的算法名会导致变量未初始化。
-3. 仓库没有自动化测试。数学判分器还包含多处裸 `except` 和非 raw regex 字符串，可能掩盖异常，
+3. 数学判分器包含多处裸 `except` 和非 raw regex 字符串，可能掩盖异常，
    并会在新版 Python 中产生无效转义警告。
 
 ## 结果复现提示
 
-- vLLM sampling、数据顺序都使用 `seed=42`，但训练代码没有显式设置 PyTorch/CUDA 的随机种子，
-  因此当前结果并非完全可复现。
+- `helper.seed_everything(seed)` 会设置 Python `random`、NumPy、PyTorch CPU/CUDA 的随机种子，
+  关闭 cuDNN benchmark、启用 cuDNN deterministic，并要求 PyTorch 使用确定性算法。训练数据和
+  vLLM server/sampling 也使用同一个 `seed`。
+- 若需要更严格的 CUDA 可复现性，应在 Python 启动前设置哈希和 cuBLAS 环境变量：
+
+  ```bash
+  PYTHONHASHSEED=42 CUBLAS_WORKSPACE_CONFIG=:4096:8 uv run python experiment/train.py
+  ```
+
+  `PYTHONHASHSEED` 在解释器启动时生效；仅在 `seed_everything` 中修改环境变量无法改变当前进程已经
+  初始化的哈希种子。
 - 保留 W&B run 配置、Git commit、GPU 型号和依赖版本，便于比较不同算法或 seed。
+- FlashAttention、vLLM、NCCL 以及不同 GPU/驱动组合仍可能带来数值差异，因此多 GPU 训练不保证
+  bitwise 一致；断点续训若要逐步复现，还需要保存并恢复 Python、NumPy、PyTorch 和 CUDA RNG 状态。
 - 开始长时间训练前，建议先用很小的数据量和生成长度完成一次 rollout、反向传播、权重同步和验证
   的端到端 smoke test。
