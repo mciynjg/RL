@@ -9,6 +9,13 @@ import random
 import time
 import os
 import shutil
+import socket
+
+with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+    s.bind(('', 0))              # 端口传 0 = 由内核自动分配空闲端口
+    vllm_port = s.getsockname()[1]
+    
+vllm_gpu_memory_utilization = 0.75
 vllm_device = 3
 training_device = "cuda:2"
 seed = 42
@@ -83,9 +90,10 @@ wandb.init(
         }
     )
 server = vllm.VLLMServer(model_id=model_name,
+                         port=vllm_port,
                          gpu=vllm_device,
                          seed = seed,
-                         gpu_memory_utilization=0.75,
+                         gpu_memory_utilization=vllm_gpu_memory_utilization,
                          )
 server.start()
 sampling_params = {}
@@ -110,7 +118,7 @@ groundtruths = []
 
 model,tokenizer = helper.get_model_and_tokenizer(model_id_or_dir=model_name,
                                device=training_device)
-tokenizer.save_pretrained(CKPT_PATH)
+
 optimizer = torch.optim.AdamW(
     model.parameters(),
     lr = learning_rate,
@@ -165,9 +173,8 @@ for step in range(0,num_rollout_steps):
     rollout_responses = []
     repeated_ground_truths = []
     
-    start = step * batch_size
-    end = start + batch_size
-    batch_indices = indices[start:end]
+    start = (step * batch_size) % len(indices)
+    batch_indices = [indices[(start + offset) % len(indices)] for offset in range(batch_size)]
     batch_prompts = [prompts[i] for i in batch_indices]
     batch_gts = [groundtruths[i] for i in batch_indices]
     rollout_start_time = time.time()
@@ -262,7 +269,8 @@ for step in range(0,num_rollout_steps):
         val_sampling_params["n"] = 1
         val_sampling_params["temperature"] = 0.0  
         
-        for i in range(0, n_val_examples, val_batch_size):
+        n_val = len(val_prompts)
+        for i in range(0, n_val, val_batch_size):
             batch_val_prompts = val_prompts[i:i+val_batch_size]
             batch_val_gts = val_groundtruths[i:i+val_batch_size]
             batch_val_completions = server.generate_completions(
@@ -278,23 +286,24 @@ for step in range(0,num_rollout_steps):
             )
             val_rewards_total += rewards.get('total_reward', 0.0)
             val_rewards_format += rewards.get('total_format_reward', 0.0)
-            if val_rewards_total > best_val_reward:
-                if os.path.exists(CKPT_PATH):
-                    shutil.rmtree(CKPT_PATH)
-                os.makedirs(CKPT_PATH,exist_ok=True)
-                model.save_pretrained(CKPT_PATH,safe_serialization = True)
-                best_val_reward = val_rewards_total
+        if val_rewards_total > best_val_reward:
+            if os.path.exists(CKPT_PATH):
+                shutil.rmtree(CKPT_PATH)
+            os.makedirs(CKPT_PATH,exist_ok=True)
+            model.save_pretrained(CKPT_PATH,safe_serialization = True)
+            best_val_reward = val_rewards_total
         wandb.log({
             # A: val 才是最终指标
-            "val/accuracy": val_rewards_total / n_val_examples,
-            "val/format_rate": val_rewards_format / n_val_examples,
-            "val/rewards_total": val_rewards_total / n_val_examples,
-            "val/rewards_format": val_rewards_format / n_val_examples,
+            "val/accuracy": val_rewards_total / n_val if n_val else 0.0,
+            "val/format_rate": val_rewards_format / n_val if n_val else 0.0,
+            "val/rewards_total": val_rewards_total / n_val if n_val else 0.0,
+            "val/rewards_format": val_rewards_format / n_val if n_val else 0.0,
             # D
             "val/response_tokens_mean": sum(val_token_lens) / len(val_token_lens) if val_token_lens else 0.0,
             "val/truncated_frac": val_truncated / len(val_token_lens) if val_token_lens else 0.0,
             "val/avg_response_length": sum(val_response_lengths) / len(val_response_lengths) if val_response_lengths else 0.0,
         }, step=step)
-        
+tokenizer.save_pretrained(CKPT_PATH)
+
 server.stop()
 wandb.finish()

@@ -1,17 +1,3 @@
-# Copyright 2025 Garena Online Private Limited
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#      http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-
 """Robust extraction and grading for mathematical answers.
 
 The public entry points intentionally match the original DR-GRPO grader.  In
@@ -547,7 +533,14 @@ def _math_verify_equal(given_answer: str, ground_truth: str, fast: bool) -> bool
         ):
             return True
         return _equations_equivalent(gold, target, timeout_seconds)
-    except (ArithmeticError, TypeError, ValueError, RuntimeError, RecursionError):
+    except (
+        ArithmeticError,
+        TypeError,
+        ValueError,
+        RuntimeError,
+        RecursionError,
+        TimeoutError,
+    ):
         return False
 
 
@@ -568,9 +561,29 @@ def _equations_equivalent(
                     if not isinstance(target_expr, sympy.Equality):
                         continue
                     target_zero = target_expr.lhs - target_expr.rhs
-                    ratio = sympy.simplify(gold_zero / target_zero)
+                    # This fallback is valid for polynomial equations up to a
+                    # non-zero constant. Variable denominators can change the
+                    # domain, so leave those cases to strict math_verify.
+                    gold_numerator, gold_denominator = sympy.together(
+                        gold_zero
+                    ).as_numer_denom()
+                    target_numerator, target_denominator = sympy.together(
+                        target_zero
+                    ).as_numer_denom()
                     if (
-                        ratio.is_zero is False
+                        gold_denominator.free_symbols
+                        or target_denominator.free_symbols
+                    ):
+                        continue
+                    try:
+                        sympy.Poly(gold_numerator)
+                        sympy.Poly(target_numerator)
+                    except (TypeError, ValueError):
+                        continue
+                    ratio = sympy.cancel(gold_numerator / target_numerator)
+                    if (
+                        ratio.is_number is True
+                        and ratio.is_zero is False
                         and not ratio.free_symbols
                         and ratio not in (sympy.nan, sympy.zoo, sympy.oo, -sympy.oo)
                     ):
@@ -610,12 +623,12 @@ def _answers_equal(given_answer: str, ground_truth: str, fast: bool = True) -> b
     if given_numeric is not None and truth_numeric is not None:
         given_value, given_percent = given_numeric
         truth_value, truth_percent = truth_numeric
+        # Compare the parsed values, so 50% and 0.5 agree while 50% and 50
+        # do not. Do not send two unequal numeric answers to a symbolic
+        # fallback that may interpret percent notation differently.
         if _fractions_close(given_value, truth_value):
             return True
-        # A percent sign is both a factor and an answer unit in common math
-        # datasets. Let math_verify resolve that ambiguity.
-        if not given_percent and not truth_percent:
-            return False
+        return False
 
     return _math_verify_equal(given_answer, ground_truth, fast)
 

@@ -290,6 +290,7 @@ def grpo_train_step(
     # D: 响应长度 / 空响应 (裁剪前的全量口径)
     metadata["response_tokens_mean"] = response_mask.sum(dim=-1).float().mean().item()
     metadata["empty_response_frac"] = (response_mask.sum(dim=-1) == 0).float().mean().item()
+    metadata["num_rollout"] = num_rollout
 
     if baseline == "mean":
         grouped_raw_rewards = raw_rewards.reshape(-1,group_size)
@@ -302,6 +303,8 @@ def grpo_train_step(
         mask = raw_rewards!=0.0
         pruned_raw_rewards = raw_rewards[mask]
     num_pruned_rollout = len(pruned_raw_rewards)
+    metadata["num_pruned_rollout"] = num_pruned_rollout
+    metadata["pruned_frac"] = 1.0 - num_pruned_rollout/num_rollout if num_rollout else 0.0
 
     if num_pruned_rollout == 0:
         return (metadata["loss"],metadata)
@@ -318,14 +321,14 @@ def grpo_train_step(
     group_normalized_rewards = group_normalized_rewards.unsqueeze(-1)
 
     # B/C: 裁剪比例与 advantage 尺度
-    metadata["num_rollout"] = num_rollout
-    metadata["num_pruned_rollout"] = num_pruned_rollout
-    metadata["pruned_frac"] = 1.0 - num_pruned_rollout/num_rollout if num_rollout else 0.0
     if num_pruned_rollout > 0:
         metadata["advantage_abs_mean"] = group_normalized_rewards.abs().mean().item()
         metadata["advantage_std"] = group_normalized_rewards.std().item() if num_pruned_rollout > 1 else 0.0
 
-    microbatch_size = min(num_rollout//gradient_accumulation_steps,num_pruned_rollout)
+    microbatch_size = max(
+        1,
+        min(num_rollout//gradient_accumulation_steps, num_pruned_rollout),
+    )
     for i in range(0,num_pruned_rollout,microbatch_size):
         #划分microbatch
         inputs_microbatch = inputs[i:i+microbatch_size].to(device)

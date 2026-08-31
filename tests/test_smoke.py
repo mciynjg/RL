@@ -11,7 +11,7 @@ import numpy as np
 import pytest
 import torch
 
-from utils import drgrpo_grader, helper, vllm_utils
+from utils import grader, helper, vllm_utils
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -172,19 +172,19 @@ def test_grpo_train_step_updates_a_tiny_cpu_policy() -> None:
 
 
 def test_math_rewards_distinguish_format_and_correctness() -> None:
-    correct = drgrpo_grader.r1_zero_reward_fn(
+    correct = grader.r1_zero_reward_fn(
         "<think>2 + 2 = 4</think> <answer>4</answer>",
         "4",
     )
-    wrong = drgrpo_grader.r1_zero_reward_fn(
+    wrong = grader.r1_zero_reward_fn(
         "<think>2 + 2 = 4</think> <answer>5</answer>",
         "4",
     )
-    malformed = drgrpo_grader.r1_zero_reward_fn(
+    malformed = grader.r1_zero_reward_fn(
         "<think>2 + 2 = 4</think><answer>4</answer>",
         "4",
     )
-    boxed = drgrpo_grader.question_only_reward_fn(r"\boxed{4}", "4")
+    boxed = grader.question_only_reward_fn(r"\boxed{4}", "4")
 
     assert correct == {"format_reward": 1.0, "answer_reward": 1.0, "reward": 1.0}
     assert wrong == {"format_reward": 1.0, "answer_reward": 0.0, "reward": 0.0}
