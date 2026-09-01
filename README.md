@@ -14,8 +14,8 @@
 - 使用 vLLM 为每个数学问题生成一组 rollout，并用 GSM8K 标准答案给分。
 - 使用严格的 R1-zero 输出契约：`<think>...</think> <answer>...</answer>`。
 - 支持 GRPO、`Dr_GRPO`、RFT、MaxRL，以及四个实验性 off-policy 配置。
-- 对退化 rollout group 进行过滤，并记录奖励、裁剪比例、梯度范数、entropy、长度和截断率。
-- 每 10 个训练更新在 GSM8K 测试集上验证，并在指标改善时保存模型权重。
+- 对退化 rollout group 进行过滤，并记录奖励、裁剪比例、梯度范数、entropy、长度、截断率，以及 off-policy 的 ratio、近似 KL 和 ESS。
+- 每 10 个外层 rollout 在 GSM8K 测试集上验证，并在指标改善时保存模型权重。
 - 提供不加载模型的 CPU smoke 测试，以及一个显式开启的 GPU/vLLM 端到端测试。
 
 ## 目录结构
@@ -41,6 +41,7 @@
 │   ├── dataset.py             # 推理和训练数据集包装
 │   ├── grader.py              # 格式检查、答案提取与数学判分
 │   ├── helper.py              # tokenization、奖励、loss 与训练步骤
+│   ├── config_validation.py   # 训练配置的启动前校验
 │   ├── vllm_utils.py          # vLLM 生命周期、批量生成与 NCCL 同步
 │   └── eval_*.py              # 三种基础模型评估脚本
 ├── pyproject.toml             # Python 版本、依赖和 pytest 配置
@@ -107,9 +108,12 @@ export WANDB_MODE=offline
 | `val_batch_size` | `64` | 验证阶段每次生成的问题数 |
 | `advantage_algorithm` | `GRPO` | 下表中的策略梯度配置名 |
 
-`rollout_batch_size` 必须能被 `group_size` 整除。若提高 `off_policy_speedup_factor`，请让
-`training_batch_size` 仍是 `group_size` 的整数倍，并保证 `gradient_accumulation_steps >= 1`。
-默认超参数下，`1`、`2`、`4`、`8`、`16`、`32` 是满足这些约束的选择。
+训练在连接 W&B、加载模型或启动 vLLM 前会校验配置。`rollout_batch_size` 必须能被
+`group_size` 和 `off_policy_speedup_factor` 整除；`inference_batch_size * group_size` 必须等于
+`rollout_batch_size`；`training_batch_size` 必须等于
+`rollout_batch_size / off_policy_speedup_factor`，且是 `group_size` 的整数倍。`gradient_accumulation_steps` 必须在
+`[1, training_batch_size]` 内。默认超参数下，`1`、`2`、`4`、`8`、`16`、`32` 是满足这些
+batch 约束的 `off_policy_speedup_factor` 选择。
 
 ### 策略梯度配置
 
@@ -132,6 +136,13 @@ export WANDB_MODE=offline
 这些 off-policy 配置是仓库当前的实验实现；应结合具体实验设定验证其行为，而不应仅依据名称把它们
 视为某篇论文的完整复现。
 
+off-policy 训练只在 CPU 上以 float32 缓存 response token 的旧 log-probabilities，训练 microbatch
+时才临时搬回策略设备。显存节省来自不保存 prompt/padding token；W&B 会额外记录
+`offpolicy/ratio_mean`、`ratio_std`、`ratio_min`、`ratio_max`、
+`approx_kl`、`clip_fraction`、`ess`、`ess_fraction` 和 `sample_count`；其中 ESS 是按当前
+importance-sample 粒度计算的有效样本数，GSPO 的粒度为 response sequence，其他裁剪方式为
+response token。
+
 ## 启动训练
 
 先在 `experiment/train.py` 中调整设备、模型、batch size 和算法名，再从项目根目录运行：
@@ -146,7 +157,7 @@ uv run python experiment/train.py
 2. 读取 GSM8K 训练集与 R1-zero prompt；`DataLoader(shuffle=True)` 产生问题 batch。
 3. 为每个问题生成 `group_size` 个回答，计算格式奖励和答案奖励。
 4. 按 `off_policy_speedup_factor` 将 rollout 切分为训练 batch，进行策略梯度更新。
-5. 每个外层 rollout 结束后通过 NCCL 同步权重；每 10 个更新还会在同步后运行验证。
+5. 每个外层 rollout 结束后通过 NCCL 同步权重；每 10 个外层 rollout 还会在同步后运行验证。
 6. 验证总奖励改善时保存模型权重，训练结束时保存 tokenizer。
 
 checkpoint 路径由 W&B run 名组成：
@@ -239,13 +250,10 @@ RUN_E2E=1 E2E_GPU=0 uv run pytest -q tests/test_e2e.py -m e2e
 
 ## 当前限制
 
-- 训练数据只经过一个随机打乱的 epoch，不会为了达到 `num_training_steps` 自动重复采样。默认
-  `inference_batch_size=32` 时，1,421 条训练数据产生 45 个外层 rollout，因此默认
-  `off_policy_speedup_factor=1` 只会执行约 45 次更新，而不是名义上的 200 次。
-- `num_training_steps` 的循环条件是 `step > num_training_steps`。如果未来数据足够，代码最多可能
-  执行 `num_training_steps + 1` 次更新。
-- 训练配置、GPU 设备、模型和 W&B 信息均硬编码在模块顶层。虽然未知算法名会给出明确异常，但其余
-  配置没有完整的启动前校验。
+- 训练数据会在迭代器耗尽后重新创建并继续随机采样，因此外层 rollout 会恰好运行
+  `num_training_steps` 次。一个外层 rollout 可按 `off_policy_speedup_factor` 拆为多个连续更新。
+- 训练配置、GPU 设备、模型和 W&B 信息均硬编码在模块顶层；启动前会校验 batch、数值范围和算法
+  配置之间的依赖关系。
 - 只有验证总奖励严格高于初始值时才保存模型权重；tokenizer 会在训练结束时无条件保存。若没有正向
   验证奖励，checkpoint 目录可能只包含 tokenizer 文件。
 - 评估脚本会覆盖固定结果文件，且 vLLM 启动逻辑会终止匹配端口的已有服务。请避免与其他实验共享

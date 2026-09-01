@@ -12,6 +12,7 @@ import shutil
 import socket
 from torch.utils.data import DataLoader
 import utils.dataset as dataset
+from utils.config_validation import validate_training_config
 
 with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
     s.bind(('', 0))              # 端口传 0 = 由内核自动分配空闲端口
@@ -24,7 +25,7 @@ seed = 42
 learning_rate = 1e-5 
 rollout_batch_size = 256 
 group_size = 8 
-num_training_steps = 200
+num_rollout_steps = 200
 off_policy_speedup_factor = 1
 training_batch_size = rollout_batch_size // off_policy_speedup_factor
 inference_batch_size = rollout_batch_size//group_size
@@ -122,6 +123,24 @@ except KeyError:
         f"Unsupported advantage algorithm: {advantage_algorithm!r}. "
         f"Supported algorithms: {supported_algorithms}."
     ) from None
+
+validate_training_config(
+    learning_rate=learning_rate,
+    rollout_batch_size=rollout_batch_size,
+    group_size=group_size,
+    inference_batch_size=inference_batch_size,
+    off_policy_speedup_factor=off_policy_speedup_factor,
+    training_batch_size=training_batch_size,
+    gradient_accumulation_steps=gradient_accumulation_steps,
+    num_training_steps=num_rollout_steps,
+    val_batch_size=val_batch_size,
+    sampling_temperature=sampling_temperature,
+    sampling_max_tokens=sampling_max_tokens,
+    max_grad_norm=max_grad_norm,
+    vllm_gpu_memory_utilization=vllm_gpu_memory_utilization,
+    advantage_algorithm=advantage_algorithm,
+    advantage_config=config,
+)
     
 (
     baseline,
@@ -129,8 +148,15 @@ except KeyError:
     loss_normalization,
     normalization_constant,
     importance_reweighting_method,
-    cliprange
-) = config.values()
+    cliprange,
+) = (
+    config["baseline"],
+    config["advantage_normalizer"],
+    config["loss_normalization"],
+    config["normalization_constant"],
+    config["importance_reweighting_method"],
+    config["cliprange"],
+)
 
 wandb_project = "RL"
 wandb_run_name = f"{advantage_algorithm}-{model_name.replace('/', '-')}-seed{seed}"
@@ -144,7 +170,7 @@ wandb.init(
         config={
             "model_name": model_name,
             "learning_rate": learning_rate,
-            "num_training_steps": num_training_steps,
+            "num_rollout_steps": num_rollout_steps,
             "rollout_batch_size": rollout_batch_size,
             "group_size": group_size,
             "gradient_accumulation_steps": gradient_accumulation_steps,
@@ -174,14 +200,6 @@ TRAIN_SET_PATH = Path(__file__).resolve().parent.parent / "data" / "gsm8k" / "tr
 VALID_SET_PATH = Path(__file__).resolve().parent.parent / "data" / "gsm8k" / "test.jsonl"
 CKPT_PATH = Path(__file__).resolve().parent.parent / "results" / "checkpoint" / f"{wandb_run_name}"
 
-
-
-
-
-prompts = []
-groundtruths = []
-
-
 model,tokenizer = helper.get_model_and_tokenizer(model_id_or_dir=model_name,
                                device=training_device)
 
@@ -192,9 +210,11 @@ optimizer = torch.optim.AdamW(
     weight_decay=0.0
 )
 
+prompts = []
+groundtruths = []
+
 with open(PROMPT_PATH, "r", encoding="utf-8") as f:
     prompt_template = f.read()
-    
 
 with open(TRAIN_SET_PATH, "r", encoding="utf-8") as f:
     for line in f :
@@ -202,7 +222,6 @@ with open(TRAIN_SET_PATH, "r", encoding="utf-8") as f:
         prompt = prompt_template.format(question=data["question"])
         prompts.append(prompt)
         groundtruths.append(helper.extract_ground_truth(data["answer"]))
-
 
 val_prompts, val_groundtruths = [], []
 with open(VALID_SET_PATH, "r", encoding="utf-8") as f:
@@ -225,10 +244,6 @@ weight_sync_group = vllm.init_weight_sync(
     policy_device=training_device
 )
 
-indices = list(range(len(prompts)))
-rng = random.Random(seed)
-rng.shuffle(indices)
-
 grad_clip_history: list[float] = []   # C: 近 50 步的裁剪触发率窗口
 best_val_reward = 0.0
 data = dataset.inferencedataset(
@@ -240,10 +255,15 @@ inferencedatalodaer = DataLoader(
     batch_size=inference_batch_size,
     shuffle=True
 )
-step  = 0
-for batch_prompts,batch_gts in inferencedatalodaer:
-    if step>num_training_steps:
-        break
+
+
+inference_data_iterator = iter(inferencedatalodaer)
+for step in range(num_rollout_steps):
+    try:
+        batch_prompts,batch_gts = next(inference_data_iterator)
+    except StopIteration:
+        inference_data_iterator = iter(inferencedatalodaer)
+        batch_prompts,batch_gts = next(inference_data_iterator)
     #inference
     repeated_prompts = []
     rollout_responses = []
@@ -284,20 +304,23 @@ for batch_prompts,batch_gts in inferencedatalodaer:
             input_ids = ids["input_ids"]
             labels = ids["labels"]
             with torch.no_grad():
-                old_log_probs_batches.append(
-                    helper.get_response_log_probs(
-                    model = model,
+                old_log_probs = helper.get_response_log_probs(
+                    model=model,
                     input_ids=input_ids,
-                    labels = labels,
-                    return_token_entropy=False
+                    labels=labels,
+                    return_token_entropy=False,
                 )["log_probs"]
+                old_log_probs_batches.append(
+                    helper.PackedResponseLogProbs.from_padded(
+                        log_probs=old_log_probs,
+                        response_mask=ids["response_mask"],
+                    )
                 )
+                del old_log_probs
     else:
         old_log_probs_batches = [None for i in range(0,len(trainingdataloader))]
     
-    for (training_prompts,training_responses,training_gt),old_log_probs in zip(trainingdataloader,old_log_probs_batches):
-        if step>num_training_steps:
-            break
+    for ((training_prompts,training_responses,training_gt),old_log_probs) in zip(trainingdataloader, old_log_probs_batches):
         train_start_time = time.time()
         loss,metadata = helper.grpo_train_step(
             model=model,
@@ -321,8 +344,7 @@ for batch_prompts,batch_gts in inferencedatalodaer:
         
         train_seconds = time.time() - train_start_time
         #train finish
-        
-
+        #log metrics
         train_rewards = metadata["train_rewards"]
         train_rewards_total = train_rewards[0].item() # type: ignore
         train_rewards_format = train_rewards[1].item() # type: ignore
@@ -330,7 +352,7 @@ for batch_prompts,batch_gts in inferencedatalodaer:
 
         # C: 梯度裁剪触发率 (clip_grad_norm_ 返回裁剪前的 norm)
         grad_norm = metadata.get("gradient_norm", 0.0)
-        grad_norm = grad_norm.item() if torch.is_tensor(grad_norm) else float(grad_norm)
+        grad_norm = grad_norm.item() if torch.is_tensor(grad_norm) else float(grad_norm) # type: ignore
         grad_clip_history.append(1.0 if grad_norm > max_grad_norm else 0.0)
         grad_clip_history = grad_clip_history[-50:]
 
@@ -340,6 +362,27 @@ for batch_prompts,batch_gts in inferencedatalodaer:
         truncated_frac = sum(
             1.0 for c in batch_completions if c.finish_reason == "length"
         ) / n_completions if n_completions else 0.0
+
+        offpolicy_metrics = {"offpolicy/enabled": importance_reweighting_method != "none"}
+        if importance_reweighting_method != "none":
+            available_offpolicy_metrics = {
+                "offpolicy/ratio_mean": metadata["importance_ratio_mean"],
+                "offpolicy/ratio_std": metadata["importance_ratio_std"],
+                "offpolicy/ratio_min": metadata["importance_ratio_min"],
+                "offpolicy/ratio_max": metadata["importance_ratio_max"],
+                "offpolicy/approx_kl": metadata["importance_approx_kl"],
+                "offpolicy/clip_fraction": metadata["importance_clip_fraction"],
+                "offpolicy/ess": metadata["importance_ess"],
+                "offpolicy/ess_fraction": metadata["importance_ess_fraction"],
+                "offpolicy/sample_count": metadata["importance_sample_count"],
+            }
+            offpolicy_metrics.update(
+                {
+                    key: value
+                    for key, value in available_offpolicy_metrics.items()
+                    if value is not None
+                }
+            )
 
         wandb.log({
             # A: 核心进展
@@ -369,6 +412,7 @@ for batch_prompts,batch_gts in inferencedatalodaer:
             # 耗时
             "time/rollout_seconds": rollout_seconds,
             "time/train_seconds": train_seconds,
+            **offpolicy_metrics,
         }, step=step)
         if (step+1) % 10 == 0:
             vllm.sync_policy_weights(
@@ -415,8 +459,7 @@ for batch_prompts,batch_gts in inferencedatalodaer:
                 "val/truncated_frac": val_truncated / len(val_token_lens) if val_token_lens else 0.0,
                 "val/avg_response_length": sum(val_response_lengths) / len(val_response_lengths) if val_response_lengths else 0.0,
             }, step=step)
-        step+=1
-
+        step+=1    
     vllm.sync_policy_weights(
         policy = model,
         vllm_base_url=server.base_url,

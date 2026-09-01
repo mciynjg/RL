@@ -2,10 +2,258 @@ import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer,PreTrainedTokenizer
 from transformers import PreTrainedTokenizerBase,PreTrainedModel
 from typing import Callable,Literal,List,Tuple
+from dataclasses import dataclass
 import random
 import re
 import os
 import numpy as np
+
+
+@dataclass(frozen=True)
+class PackedResponseLogProbs:
+    """CPU-resident response-only log-probabilities for one rollout batch.
+
+    The packed representation deliberately omits prompt and padding positions.
+    ``materialize`` reconstructs only the current microbatch, so callers do not
+    need to keep a dense ``[batch, sequence]`` cache on the training device.
+    """
+
+    values: torch.Tensor
+    offsets: torch.Tensor
+
+    @classmethod
+    def from_padded(
+        cls,
+        log_probs: torch.Tensor,
+        response_mask: torch.Tensor,
+        *,
+        storage_dtype: torch.dtype = torch.float32,
+    ) -> "PackedResponseLogProbs":
+        if log_probs.ndim != 2 or response_mask.ndim != 2:
+            raise ValueError("log_probs and response_mask must both be rank-2 tensors.")
+        if log_probs.shape != response_mask.shape:
+            raise ValueError(
+                "log_probs and response_mask must have the same shape "
+                f"(got {tuple(log_probs.shape)} and {tuple(response_mask.shape)})."
+            )
+        if not log_probs.is_floating_point():
+            raise TypeError("log_probs must use a floating-point dtype.")
+        if not response_mask.dtype == torch.bool:
+            response_mask = response_mask.to(dtype=torch.bool)
+
+        mask_on_log_prob_device = response_mask.to(
+            device=log_probs.device,
+            dtype=torch.bool,
+        )
+        lengths = response_mask.sum(dim=-1, dtype=torch.long).to(device="cpu")
+        offsets = torch.cat((torch.zeros(1, dtype=torch.long), lengths.cumsum(dim=0)))
+        return cls(
+            values=log_probs.masked_select(mask_on_log_prob_device)
+            .detach()
+            .to(device="cpu", dtype=storage_dtype)
+            .contiguous(),
+            offsets=offsets,
+        )
+
+    @property
+    def num_sequences(self) -> int:
+        return self.offsets.numel() - 1
+
+    def select(self, mask: torch.Tensor) -> "PackedResponseLogProbs":
+        """Select rollout rows while preserving their response-only packing."""
+        mask = mask.detach().to(device="cpu", dtype=torch.bool).flatten()
+        if mask.numel() != self.num_sequences:
+            raise ValueError(
+                "selection mask length must match packed rollout count "
+                f"(got {mask.numel()} and {self.num_sequences})."
+            )
+        selected_indices = mask.nonzero(as_tuple=False).flatten().tolist()
+        chunks = [
+            self.values[int(self.offsets[index]) : int(self.offsets[index + 1])]
+            for index in selected_indices
+        ]
+        selected_values = torch.cat(chunks) if chunks else self.values.new_empty(0)
+        selected_lengths = torch.tensor(
+            [chunk.numel() for chunk in chunks],
+            dtype=torch.long,
+        )
+        selected_offsets = torch.cat(
+            (torch.zeros(1, dtype=torch.long), selected_lengths.cumsum(dim=0))
+        )
+        return PackedResponseLogProbs(selected_values, selected_offsets)
+
+    def slice(self, start: int, stop: int) -> "PackedResponseLogProbs":
+        """Return a contiguous sequence range without materializing padding."""
+        if not 0 <= start <= stop <= self.num_sequences:
+            raise ValueError(
+                f"invalid packed sequence slice [{start}:{stop}] for {self.num_sequences} sequences."
+            )
+        value_start = int(self.offsets[start])
+        value_stop = int(self.offsets[stop])
+        return PackedResponseLogProbs(
+            self.values[value_start:value_stop],
+            self.offsets[start : stop + 1] - value_start,
+        )
+
+    def materialize(
+        self,
+        response_mask: torch.Tensor,
+        *,
+        device: torch.device | str,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        """Materialize packed values into a dense tensor for one microbatch."""
+        if response_mask.ndim != 2:
+            raise ValueError("response_mask must be a rank-2 tensor.")
+        if response_mask.shape[0] != self.num_sequences:
+            raise ValueError(
+                "response_mask row count must match packed rollout count "
+                f"(got {response_mask.shape[0]} and {self.num_sequences})."
+            )
+        response_mask = response_mask.to(device=device, dtype=torch.bool)
+        response_lengths = response_mask.sum(dim=-1, dtype=torch.long).to(device="cpu")
+        packed_lengths = self.offsets[1:] - self.offsets[:-1]
+        if not torch.equal(response_lengths, packed_lengths):
+            raise ValueError(
+                "packed response lengths do not match response_mask: "
+                f"got {response_lengths.tolist()} and {packed_lengths.tolist()}."
+            )
+        materialized = torch.zeros(
+            response_mask.shape,
+            device=device,
+            dtype=dtype,
+        )
+        values = self.values.to(device=device, dtype=dtype)
+        if values.numel():
+            materialized[response_mask] = values
+        return materialized
+
+
+_IMPORTANCE_STAT_KEYS = (
+    "_ratio_sum",
+    "_ratio_sq_sum",
+    "_ratio_count",
+    "_ratio_min",
+    "_ratio_max",
+    "_kl_sum",
+    "_clip_count",
+)
+
+
+@torch.no_grad()
+def _importance_statistics(
+    policy_log_probs: torch.Tensor,
+    old_log_probs: torch.Tensor | None,
+    response_mask: torch.Tensor | None,
+    importance_reweighting_method: str,
+    cliprange: float | None,
+) -> dict[str, float]:
+    """Return detached sufficient statistics for off-policy diagnostics.
+
+    Token-ratio methods contribute one sample per response token. GSPO uses one
+    geometric-mean ratio per response sequence, matching its objective.
+    """
+    if importance_reweighting_method == "none" or old_log_probs is None:
+        return {key: 0.0 for key in _IMPORTANCE_STAT_KEYS}
+    if response_mask is None:
+        mask = torch.ones_like(policy_log_probs, dtype=torch.bool)
+    else:
+        mask = response_mask.to(device=policy_log_probs.device, dtype=torch.bool)
+
+    log_ratio = policy_log_probs.float() - old_log_probs.float()
+    if importance_reweighting_method == "gspo":
+        sequence_lengths = mask.sum(dim=-1)
+        valid_sequences = sequence_lengths > 0
+        if not valid_sequences.any():
+            return {key: 0.0 for key in _IMPORTANCE_STAT_KEYS}
+        sequence_log_ratio = (log_ratio * mask).sum(dim=-1) / sequence_lengths.clamp_min(1)
+        ratios = torch.exp(sequence_log_ratio[valid_sequences])
+        sequence_log_ratio = sequence_log_ratio[valid_sequences]
+        kl_values = ratios - 1 - sequence_log_ratio
+        clipped = torch.zeros_like(ratios, dtype=torch.bool)
+        if cliprange is not None:
+            clipped = (ratios < 1 - cliprange) | (ratios > 1 + cliprange)
+    else:
+        valid = mask
+        if not valid.any():
+            return {key: 0.0 for key in _IMPORTANCE_STAT_KEYS}
+        ratios = torch.exp(log_ratio[valid])
+        kl_values = ratios - 1 - log_ratio[valid]
+        clipped = torch.zeros_like(ratios, dtype=torch.bool)
+        if importance_reweighting_method == "grpo" and cliprange is not None:
+            clipped = (ratios < 1 - cliprange) | (ratios > 1 + cliprange)
+
+    ratios = ratios.detach()
+    kl_values = kl_values.detach()
+    finite_values = torch.isfinite(ratios) & torch.isfinite(kl_values)
+    ratios = ratios[finite_values]
+    kl_values = kl_values[finite_values]
+    clipped = clipped[finite_values]
+    if ratios.numel() == 0:
+        return {key: 0.0 for key in _IMPORTANCE_STAT_KEYS}
+    ratio_sum = float(ratios.sum().item())
+    ratio_sq_sum = float((ratios * ratios).sum().item())
+    return {
+        "_ratio_sum": ratio_sum,
+        "_ratio_sq_sum": ratio_sq_sum,
+        "_ratio_count": float(ratios.numel()),
+        "_ratio_min": float(ratios.min().item()),
+        "_ratio_max": float(ratios.max().item()),
+        "_kl_sum": float(kl_values.sum().item()),
+        "_clip_count": float(clipped.sum().item()),
+    }
+
+
+def _finalize_importance_statistics(
+    statistics: dict[str, float],
+) -> dict[str, float | None]:
+    count = statistics["_ratio_count"]
+    if count <= 0:
+        return {
+            "importance_ratio_mean": None,
+            "importance_ratio_std": None,
+            "importance_ratio_min": None,
+            "importance_ratio_max": None,
+            "importance_approx_kl": None,
+            "importance_clip_fraction": None,
+            "importance_ess": None,
+            "importance_ess_fraction": None,
+            "importance_sample_count": 0.0,
+        }
+    ratio_sum = statistics["_ratio_sum"]
+    ratio_sq_sum = statistics["_ratio_sq_sum"]
+    ratio_mean = ratio_sum / count
+    ratio_variance = max(ratio_sq_sum / count - ratio_mean * ratio_mean, 0.0)
+    ess = (ratio_sum * ratio_sum) / ratio_sq_sum if ratio_sq_sum > 0 else 0.0
+    return {
+        "importance_ratio_mean": ratio_mean,
+        "importance_ratio_std": ratio_variance**0.5,
+        "importance_ratio_min": statistics["_ratio_min"],
+        "importance_ratio_max": statistics["_ratio_max"],
+        "importance_approx_kl": statistics["_kl_sum"] / count,
+        "importance_clip_fraction": statistics["_clip_count"] / count,
+        "importance_ess": ess,
+        "importance_ess_fraction": ess / count,
+        "importance_sample_count": count,
+    }
+
+
+def _accumulate_importance_statistics(
+    total: dict[str, float],
+    current: dict[str, float],
+) -> None:
+    """Merge one microbatch's sufficient statistics into a train-step total."""
+    if current["_ratio_count"] <= 0:
+        return
+    if total["_ratio_count"] <= 0:
+        total.update(current)
+        return
+    for key in ("_ratio_sum", "_ratio_sq_sum", "_ratio_count", "_kl_sum", "_clip_count"):
+        total[key] += current[key]
+    total["_ratio_min"] = min(total["_ratio_min"], current["_ratio_min"])
+    total["_ratio_max"] = max(total["_ratio_max"], current["_ratio_max"])
+
+
 def seed_everything(seed: int) -> None:
     os.environ["PYTHONHASHSEED"] = str(seed)
 
@@ -185,25 +433,31 @@ def compute_policy_gradient_loss(
     old_log_probs: torch.Tensor | None = None, 
     cliprange: float | None = None, 
     response_mask: torch.Tensor | None = None, 
-    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    ) -> tuple[torch.Tensor, dict[str, float]]:
     if importance_reweighting_method == "none":
         per_token_policy_gradient_loss = -raw_rewards_or_advantages*policy_log_probs
     elif importance_reweighting_method == "noclip":
         if old_log_probs is not None :
-            importance_reweighting = torch.exp(policy_log_probs-old_log_probs)
+            importance_reweighting = torch.exp(
+                policy_log_probs.float() - old_log_probs.float()
+            )
             per_token_policy_gradient_loss = -raw_rewards_or_advantages*importance_reweighting
         else:
             raise ValueError("must pass old_log_probs")
     elif importance_reweighting_method == "grpo":
         if old_log_probs is not None and cliprange is not None:
-            per_token_importance_reweighting = torch.exp(policy_log_probs-old_log_probs)
+            per_token_importance_reweighting = torch.exp(
+                policy_log_probs.float() - old_log_probs.float()
+            )
             clip_term = torch.min(torch.max(per_token_importance_reweighting,torch.tensor(1-cliprange,device=per_token_importance_reweighting.device)),torch.tensor(1+cliprange,device=per_token_importance_reweighting.device))
             per_token_policy_gradient_loss = -torch.min(raw_rewards_or_advantages*per_token_importance_reweighting,raw_rewards_or_advantages*clip_term)
         else:
             raise ValueError("must pass old_log_probs and cliprange")
     elif importance_reweighting_method == "gspo":
         if old_log_probs is not None and cliprange is not None and response_mask is not None:
-            sequence_importance_reweighting = ((policy_log_probs-old_log_probs)*response_mask).sum(dim=-1,keepdim=True)
+            sequence_importance_reweighting = (
+                (policy_log_probs.float() - old_log_probs.float()) * response_mask
+            ).sum(dim=-1,keepdim=True)
             logs = sequence_importance_reweighting/(response_mask.sum(dim=-1,keepdim=True)+1e-6)
             s = torch.exp(logs)
             clip_term = torch.min(torch.max(s,torch.tensor(1-cliprange,device=sequence_importance_reweighting.device)),torch.tensor(1+cliprange,device=sequence_importance_reweighting.device))
@@ -213,7 +467,19 @@ def compute_policy_gradient_loss(
             raise ValueError("must pass old_log_probs,cliprange and response_mask")
     else:
         raise NotImplementedError
+    raw_statistics = _importance_statistics(
+        policy_log_probs=policy_log_probs,
+        old_log_probs=old_log_probs,
+        response_mask=response_mask,
+        importance_reweighting_method=importance_reweighting_method,
+        cliprange=cliprange,
+    )
     metadata = {}
+    if importance_reweighting_method != "none":
+        metadata = {
+            **raw_statistics,
+            **_finalize_importance_statistics(raw_statistics),
+        }
     return (per_token_policy_gradient_loss,metadata)
 
 def aggregate_loss_across_microbatch(  
@@ -253,12 +519,12 @@ def grpo_train_step(
     advantage_normalizer: Literal["std", "none", "mean"] = "std", 
     # Importance reweighting and clipping 
     importance_reweighting_method: Literal["none", "noclip", "grpo", "gspo"] = "none", 
-    old_log_probs: torch.Tensor | None = None, 
+    old_log_probs: PackedResponseLogProbs | torch.Tensor | None = None,
     cliprange: float | None = None, 
     # Loss normalization 
     loss_normalization: Literal["sequence", "constant"] = "sequence", 
     normalization_constant: int | None = None, 
-    ) -> tuple[torch.Tensor, dict[str, torch.Tensor | float]]:
+    ) -> tuple[torch.Tensor, dict[str, object]]:
     
     optimizer.zero_grad()
     
@@ -286,6 +552,8 @@ def grpo_train_step(
         "response_tokens_mean":0.0,
         "empty_response_frac":0.0,
     }
+    importance_statistics = {key: 0.0 for key in _IMPORTANCE_STAT_KEYS}
+    metadata.update(_finalize_importance_statistics(importance_statistics))
     
     tokens = tokenize_prompt_and_output(prompt_strs=repeated_prompts,
                                      output_strs=rollout_responses,
@@ -328,15 +596,19 @@ def grpo_train_step(
         mask = mask.repeat_interleave(group_size)
         pruned_raw_rewards = raw_rewards[mask]
         if old_log_probs is not None:
-            old_log_probs = old_log_probs.to(mask.device)
-            old_log_probs = old_log_probs[mask]
+            if isinstance(old_log_probs, PackedResponseLogProbs):
+                old_log_probs = old_log_probs.select(mask)
+            else:
+                old_log_probs = old_log_probs.to(mask.device)[mask]
 
     if baseline == "none":
         mask = raw_rewards!=0.0
         pruned_raw_rewards = raw_rewards[mask]
         if old_log_probs is not None:
-            old_log_probs = old_log_probs.to(mask.device)
-            old_log_probs = old_log_probs[mask]
+            if isinstance(old_log_probs, PackedResponseLogProbs):
+                old_log_probs = old_log_probs.select(mask)
+            else:
+                old_log_probs = old_log_probs.to(mask.device)[mask]
     num_pruned_rollout = len(pruned_raw_rewards)
     metadata["num_pruned_rollout"] = num_pruned_rollout
     metadata["pruned_frac"] = 1.0 - num_pruned_rollout/num_rollout if num_rollout else 0.0
@@ -370,10 +642,6 @@ def grpo_train_step(
         labels_microbatch = labels[i:i+microbatch_size].to(device)
         response_mask_microbatch = response_mask[i:i+microbatch_size].to(device)
         group_normalized_rewards_microbatch = group_normalized_rewards[i:i+microbatch_size].to(device)
-        if old_log_probs is not None:
-            old_log_probs_microbatch = old_log_probs[i:i+microbatch_size].to(device)
-        else:
-            old_log_probs_microbatch = None
         log_probs_and_token_entropy= get_response_log_probs(
             model=model,
             input_ids=inputs_microbatch,
@@ -392,7 +660,21 @@ def grpo_train_step(
         metadata["token_entropy"] += microbatch_avg_entropy.item() * valid_tokens_in_microbatch
         metadata["total_valid_tokens"] += valid_tokens_in_microbatch
         
-        per_token_policy_gradient_loss,_ = compute_policy_gradient_loss(
+        if isinstance(old_log_probs, PackedResponseLogProbs):
+            old_log_probs_microbatch = old_log_probs.slice(
+                i,
+                min(i + microbatch_size, num_pruned_rollout),
+            ).materialize(
+                response_mask_microbatch,
+                device=device,
+                dtype=torch.float32,
+            )
+        elif old_log_probs is not None:
+            old_log_probs_microbatch = old_log_probs[i:i+microbatch_size].to(device)
+        else:
+            old_log_probs_microbatch = None
+
+        per_token_policy_gradient_loss,importance_metadata = compute_policy_gradient_loss(
             raw_rewards_or_advantages=group_normalized_rewards_microbatch,
             policy_log_probs=log_probs,
             importance_reweighting_method=importance_reweighting_method,
@@ -400,6 +682,8 @@ def grpo_train_step(
             cliprange=cliprange,
             response_mask=response_mask_microbatch
         )
+        if importance_reweighting_method != "none":
+            _accumulate_importance_statistics(importance_statistics, importance_metadata)
         loss = aggregate_loss_across_microbatch(
             per_token_policy_gradient_loss=per_token_policy_gradient_loss,
             mask=response_mask_microbatch,
@@ -422,6 +706,7 @@ def grpo_train_step(
         metadata["token_entropy"] = metadata["token_entropy"] / metadata["total_valid_tokens"]
     else:
         metadata["token_entropy"] = 0.0
+    metadata.update(_finalize_importance_statistics(importance_statistics))
     
     optimizer.step()
     optimizer.zero_grad()

@@ -11,7 +11,7 @@ import numpy as np
 import pytest
 import torch
 
-from utils import grader, helper, vllm_utils
+from utils import config_validation, grader, helper, vllm_utils
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -59,6 +59,64 @@ def test_seed_everything_replays_python_numpy_and_torch_randomness() -> None:
     assert torch.are_deterministic_algorithms_enabled()
 
 
+def _valid_training_config() -> dict[str, object]:
+    return {
+        "learning_rate": 1e-5,
+        "rollout_batch_size": 256,
+        "group_size": 8,
+        "inference_batch_size": 32,
+        "off_policy_speedup_factor": 1,
+        "training_batch_size": 256,
+        "gradient_accumulation_steps": 32,
+        "num_training_steps": 200,
+        "val_batch_size": 64,
+        "sampling_temperature": 1.0,
+        "sampling_max_tokens": 512,
+        "max_grad_norm": 1.0,
+        "vllm_gpu_memory_utilization": 0.75,
+        "advantage_algorithm": "GRPO",
+        "advantage_config": {
+            "baseline": "mean",
+            "advantage_normalizer": "std",
+            "loss_normalization": "sequence",
+            "normalization_constant": None,
+            "importance_reweighting_method": "none",
+            "cliprange": None,
+        },
+    }
+
+
+def test_training_config_validation_accepts_default_layout() -> None:
+    config_validation.validate_training_config(**_valid_training_config())
+
+
+def test_training_config_validation_reports_batch_group_contracts() -> None:
+    config = _valid_training_config()
+    config["inference_batch_size"] = 31
+    config["training_batch_size"] = 60
+
+    with pytest.raises(ValueError) as error:
+        config_validation.validate_training_config(**config)
+
+    message = str(error.value)
+    assert "inference_batch_size * group_size" in message
+    assert "training_batch_size must equal" in message
+    assert "training_batch_size must be divisible by group_size" in message
+
+
+def test_training_config_validation_checks_algorithm_dependencies() -> None:
+    config = _valid_training_config()
+    config["advantage_algorithm"] = "offpolicy_grpo"
+    config["advantage_config"] = {
+        **config["advantage_config"],
+        "importance_reweighting_method": "grpo",
+        "cliprange": None,
+    }
+
+    with pytest.raises(ValueError, match="cliprange must be in \\(0, 1\\)"):
+        config_validation.validate_training_config(**config)
+
+
 class _TinyTokenizer:
     """Minimal tokenizer double for the tokenize helper's injected interface."""
 
@@ -83,6 +141,83 @@ def test_tokenize_prompt_and_output_builds_response_mask() -> None:
     assert tokens["input_ids"].tolist() == [[1, 2, 3, 4]]
     assert tokens["labels"].tolist() == [[2, 3, 4, 5]]
     assert tokens["response_mask"].tolist() == [[False, True, True, True]]
+
+
+def test_packed_response_log_probs_offloads_only_response_tokens() -> None:
+    log_probs = torch.tensor(
+        [[-1.0, -2.0, -3.0, -4.0], [-5.0, -6.0, -7.0, -8.0]],
+        dtype=torch.float32,
+    )
+    response_mask = torch.tensor(
+        [[False, True, True, False], [False, False, True, True]],
+    )
+
+    packed = helper.PackedResponseLogProbs.from_padded(log_probs, response_mask)
+
+    assert packed.values.device.type == "cpu"
+    assert packed.values.dtype == torch.float32
+    assert packed.values.tolist() == pytest.approx([-2.0, -3.0, -7.0, -8.0])
+    assert packed.offsets.tolist() == [0, 2, 4]
+
+    selected = packed.select(torch.tensor([False, True]))
+    materialized = selected.materialize(
+        response_mask=response_mask[1:],
+        device="cpu",
+        dtype=torch.float32,
+    )
+    assert torch.allclose(
+        materialized,
+        torch.tensor([[0.0, 0.0, -7.0, -8.0]]),
+    )
+
+
+def test_importance_metrics_report_ratio_kl_clip_and_ess() -> None:
+    policy_log_probs = torch.log(torch.tensor([[2.0, 0.5]]))
+    old_log_probs = torch.zeros_like(policy_log_probs)
+    response_mask = torch.ones_like(policy_log_probs, dtype=torch.bool)
+
+    _, metadata = helper.compute_policy_gradient_loss(
+        raw_rewards_or_advantages=torch.ones_like(policy_log_probs),
+        policy_log_probs=policy_log_probs,
+        importance_reweighting_method="grpo",
+        old_log_probs=old_log_probs,
+        cliprange=0.2,
+        response_mask=response_mask,
+    )
+
+    assert metadata["importance_sample_count"] == pytest.approx(2.0)
+    assert metadata["importance_ratio_mean"] == pytest.approx(1.25)
+    assert metadata["importance_ratio_min"] == pytest.approx(0.5)
+    assert metadata["importance_ratio_max"] == pytest.approx(2.0)
+    assert metadata["importance_clip_fraction"] == pytest.approx(1.0)
+    assert metadata["importance_ess"] == pytest.approx(25 / 17)
+    assert metadata["importance_ess_fraction"] == pytest.approx(25 / 34)
+    assert metadata["importance_approx_kl"] == pytest.approx(
+        (
+            (2.0 - 1.0 - torch.log(torch.tensor(2.0))).item()
+            + (0.5 - 1.0 - torch.log(torch.tensor(0.5))).item()
+        )
+        / 2
+    )
+
+
+def test_gspo_importance_metrics_aggregate_by_sequence() -> None:
+    policy_log_probs = torch.log(torch.tensor([[2.0, 2.0], [0.5, 0.5]]))
+    old_log_probs = torch.zeros_like(policy_log_probs)
+    response_mask = torch.ones_like(policy_log_probs, dtype=torch.bool)
+
+    _, metadata = helper.compute_policy_gradient_loss(
+        raw_rewards_or_advantages=torch.ones_like(policy_log_probs),
+        policy_log_probs=policy_log_probs,
+        importance_reweighting_method="gspo",
+        old_log_probs=old_log_probs,
+        cliprange=0.2,
+        response_mask=response_mask,
+    )
+
+    assert metadata["importance_sample_count"] == pytest.approx(2.0)
+    assert metadata["importance_ratio_mean"] == pytest.approx(1.25)
+    assert metadata["importance_clip_fraction"] == pytest.approx(1.0)
 
 
 def test_rollout_rewards_and_group_advantages() -> None:
@@ -169,6 +304,50 @@ def test_grpo_train_step_updates_a_tiny_cpu_policy() -> None:
         not torch.equal(before, after)
         for before, after in zip(parameters_before, model.parameters())
     )
+
+
+def test_grpo_train_step_accepts_packed_off_policy_log_probs() -> None:
+    helper.seed_everything(42)
+    model = _TinyPolicy()
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
+    prompts = ["prompt", "prompt"]
+    responses = ["correct", "wrong"]
+    tokens = helper.tokenize_prompt_and_output(prompts, responses, _TinyTokenizer())
+    with torch.no_grad():
+        dense_old_log_probs = helper.get_response_log_probs(
+            model,
+            tokens["input_ids"],
+            tokens["labels"],
+        )["log_probs"]
+    packed_old_log_probs = helper.PackedResponseLogProbs.from_padded(
+        dense_old_log_probs,
+        tokens["response_mask"],
+    )
+
+    def reward_fn(response: str, ground_truth: str) -> dict[str, float]:
+        correct = float(response == ground_truth)
+        return {"reward": correct, "format_reward": 1.0}
+
+    loss, metadata = helper.grpo_train_step(
+        model=model,
+        tokenizer=_TinyTokenizer(),
+        optimizer=optimizer,
+        gradient_accumulation_steps=2,
+        max_grad_norm=1.0,
+        reward_fn=reward_fn,
+        repeated_prompts=prompts,
+        rollout_responses=responses,
+        repeated_ground_truths=["correct", "correct"],
+        group_size=2,
+        importance_reweighting_method="grpo",
+        old_log_probs=packed_old_log_probs,
+        cliprange=0.2,
+    )
+
+    assert torch.isfinite(loss)
+    assert metadata["importance_sample_count"] == pytest.approx(2.0)
+    assert metadata["importance_approx_kl"] is not None
+    assert metadata["importance_ess_fraction"] == pytest.approx(1.0, abs=1e-3)
 
 
 def test_math_rewards_distinguish_format_and_correctness() -> None:
