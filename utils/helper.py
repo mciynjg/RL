@@ -99,6 +99,10 @@ def get_response_log_probs(
     labels: torch.Tensor, 
     return_token_entropy: bool = False, 
     ) -> dict[str, torch.Tensor]:
+    
+    device = next(model.parameters()).device
+    input_ids = input_ids.to(device)
+    labels = labels.to(device)
     logits = model(input_ids).logits
     all_log_probs = torch.log_softmax(logits,dim=-1)
     log_probs = all_log_probs.gather(dim = -1,index=labels.unsqueeze(-1)).squeeze(-1)
@@ -157,9 +161,10 @@ def compute_group_normalized_rewards(
         factor = torch.std(raw_rewards,dim=-1,keepdim=True)
     elif advantage_normalizer == "none":
         factor = 1.0
-    else:
+    elif advantage_normalizer == "mean":
         factor = torch.mean(raw_rewards,dim=-1,keepdim=True)
-    
+    else:
+        raise NotImplementedError
     advantage = ((raw_rewards-b)/(advantage_eps+factor)).flatten()
     avg_reward = torch.mean(raw_rewards).item()
     std_reward = torch.std(raw_rewards).item()
@@ -183,6 +188,29 @@ def compute_policy_gradient_loss(
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     if importance_reweighting_method == "none":
         per_token_policy_gradient_loss = -raw_rewards_or_advantages*policy_log_probs
+    elif importance_reweighting_method == "noclip":
+        if old_log_probs is not None :
+            importance_reweighting = torch.exp(policy_log_probs-old_log_probs)
+            per_token_policy_gradient_loss = -raw_rewards_or_advantages*importance_reweighting
+        else:
+            raise ValueError("must pass old_log_probs")
+    elif importance_reweighting_method == "grpo":
+        if old_log_probs is not None and cliprange is not None:
+            per_token_importance_reweighting = torch.exp(policy_log_probs-old_log_probs)
+            clip_term = torch.min(torch.max(per_token_importance_reweighting,torch.tensor(1-cliprange,device=per_token_importance_reweighting.device)),torch.tensor(1+cliprange,device=per_token_importance_reweighting.device))
+            per_token_policy_gradient_loss = -torch.min(raw_rewards_or_advantages*per_token_importance_reweighting,raw_rewards_or_advantages*clip_term)
+        else:
+            raise ValueError("must pass old_log_probs and cliprange")
+    elif importance_reweighting_method == "gspo":
+        if old_log_probs is not None and cliprange is not None and response_mask is not None:
+            sequence_importance_reweighting = ((policy_log_probs-old_log_probs)*response_mask).sum(dim=-1,keepdim=True)
+            logs = sequence_importance_reweighting/(response_mask.sum(dim=-1,keepdim=True)+1e-6)
+            s = torch.exp(logs)
+            clip_term = torch.min(torch.max(s,torch.tensor(1-cliprange,device=sequence_importance_reweighting.device)),torch.tensor(1+cliprange,device=sequence_importance_reweighting.device))
+            per_token_policy_gradient_loss = -torch.min(raw_rewards_or_advantages*s,raw_rewards_or_advantages*clip_term)
+            per_token_policy_gradient_loss = per_token_policy_gradient_loss.expand_as(policy_log_probs)
+        else:
+            raise ValueError("must pass old_log_probs,cliprange and response_mask")
     else:
         raise NotImplementedError
     metadata = {}
@@ -225,7 +253,8 @@ def grpo_train_step(
     advantage_normalizer: Literal["std", "none", "mean"] = "std", 
     # Importance reweighting and clipping 
     importance_reweighting_method: Literal["none", "noclip", "grpo", "gspo"] = "none", 
-    old_log_probs: torch.Tensor | None = None, cliprange: float | None = None, 
+    old_log_probs: torch.Tensor | None = None, 
+    cliprange: float | None = None, 
     # Loss normalization 
     loss_normalization: Literal["sequence", "constant"] = "sequence", 
     normalization_constant: int | None = None, 
@@ -263,9 +292,9 @@ def grpo_train_step(
                                      tokenizer=tokenizer)
     
     
-    inputs = tokens["input_ids"]#.to(device)
-    labels = tokens["labels"]#.to(device)
-    response_mask = tokens["response_mask"]#.to(device)
+    inputs = tokens["input_ids"]
+    labels = tokens["labels"]
+    response_mask = tokens["response_mask"]
     num_rollout = len(repeated_prompts)
     raw_rewards,raw_rewards_metadata = compute_rollout_rewards(
                 reward_fn=reward_fn,
@@ -298,10 +327,16 @@ def grpo_train_step(
         mask = std!=0.0
         mask = mask.repeat_interleave(group_size)
         pruned_raw_rewards = raw_rewards[mask]
+        if old_log_probs is not None:
+            old_log_probs = old_log_probs.to(mask.device)
+            old_log_probs = old_log_probs[mask]
 
     if baseline == "none":
         mask = raw_rewards!=0.0
         pruned_raw_rewards = raw_rewards[mask]
+        if old_log_probs is not None:
+            old_log_probs = old_log_probs.to(mask.device)
+            old_log_probs = old_log_probs[mask]
     num_pruned_rollout = len(pruned_raw_rewards)
     metadata["num_pruned_rollout"] = num_pruned_rollout
     metadata["pruned_frac"] = 1.0 - num_pruned_rollout/num_rollout if num_rollout else 0.0
@@ -335,6 +370,10 @@ def grpo_train_step(
         labels_microbatch = labels[i:i+microbatch_size].to(device)
         response_mask_microbatch = response_mask[i:i+microbatch_size].to(device)
         group_normalized_rewards_microbatch = group_normalized_rewards[i:i+microbatch_size].to(device)
+        if old_log_probs is not None:
+            old_log_probs_microbatch = old_log_probs[i:i+microbatch_size].to(device)
+        else:
+            old_log_probs_microbatch = None
         log_probs_and_token_entropy= get_response_log_probs(
             model=model,
             input_ids=inputs_microbatch,
@@ -357,7 +396,7 @@ def grpo_train_step(
             raw_rewards_or_advantages=group_normalized_rewards_microbatch,
             policy_log_probs=log_probs,
             importance_reweighting_method=importance_reweighting_method,
-            old_log_probs=old_log_probs,
+            old_log_probs=old_log_probs_microbatch,
             cliprange=cliprange,
             response_mask=response_mask_microbatch
         )
