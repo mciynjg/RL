@@ -223,12 +223,17 @@ def test_gspo_importance_metrics_aggregate_by_sequence() -> None:
 def test_rollout_rewards_and_group_advantages() -> None:
     def reward_fn(response: str, ground_truth: str) -> dict[str, float]:
         correct = float(response == ground_truth)
-        return {"reward": correct, "format_reward": 1.0}
+        return {
+            "reward": correct,
+            "answer_reward": correct,
+            "format_reward": 1.0,
+        }
 
     raw_rewards, metadata = helper.compute_rollout_rewards(
         reward_fn=reward_fn,
         rollout_responses=["yes", "no"],
         repeated_ground_truths=["yes", "yes"],
+        group_size=2,
     )
     advantages, group_metadata = helper.compute_group_normalized_rewards(
         raw_rewards=torch.tensor([0.0, 1.0, 2.0, 4.0]),
@@ -237,12 +242,49 @@ def test_rollout_rewards_and_group_advantages() -> None:
 
     assert raw_rewards.tolist() == [1.0, 0.0]
     assert metadata["total_reward"] == pytest.approx(1.0)
+    assert metadata["total_answer_reward"] == pytest.approx(1.0)
+    assert metadata["pass@1"] == pytest.approx(0.5)
+    assert metadata["pass@group_size"] == pytest.approx(1.0)
     assert metadata["mean_format_reward"] == pytest.approx(1.0)
     assert advantages.tolist() == pytest.approx(
         [-0.707106, 0.707106, -0.707106, 0.707106],
         abs=1e-5,
     )
     assert group_metadata["avg_reward"] == pytest.approx(1.75)
+
+
+def test_rollout_reward_signal_is_distinct_from_answer_reward() -> None:
+    def reward_fn(response: str, ground_truth: str) -> dict[str, float]:
+        if response == "formatted":
+            return {"reward": 0.0, "answer_reward": 1.0, "format_reward": 0.0}
+        return {"reward": 1.0, "answer_reward": 0.0, "format_reward": 1.0}
+
+    raw_rewards, metadata = helper.compute_rollout_rewards(
+        reward_fn=reward_fn,
+        rollout_responses=["formatted", "wrong"],
+        repeated_ground_truths=["answer", "answer"],
+        group_size=2,
+    )
+
+    assert raw_rewards.tolist() == [0.0, 1.0]
+    assert metadata["total_reward"] == pytest.approx(1.0)
+    assert metadata["total_answer_reward"] == pytest.approx(1.0)
+    assert metadata["pass@1"] == pytest.approx(0.5)
+    assert metadata["pass@group_size"] == pytest.approx(1.0)
+
+
+def test_empty_rollout_group_pass_rate_is_zero() -> None:
+    def reward_fn(response: str, ground_truth: str) -> dict[str, float]:
+        return {"reward": 0.0, "answer_reward": 0.0, "format_reward": 0.0}
+
+    _, metadata = helper.compute_rollout_rewards(
+        reward_fn=reward_fn,
+        rollout_responses=[],
+        repeated_ground_truths=[],
+        group_size=2,
+    )
+
+    assert metadata["pass@group_size"] == 0.0
 
 
 def test_loss_aggregation_supports_sequence_and_constant_normalization() -> None:
@@ -281,7 +323,11 @@ def test_grpo_train_step_updates_a_tiny_cpu_policy() -> None:
 
     def reward_fn(response: str, ground_truth: str) -> dict[str, float]:
         correct = float(response == ground_truth)
-        return {"reward": correct, "format_reward": 1.0}
+        return {
+            "reward": correct,
+            "answer_reward": correct,
+            "format_reward": 1.0,
+        }
 
     loss, metadata = helper.grpo_train_step(
         model=model,
@@ -300,6 +346,8 @@ def test_grpo_train_step_updates_a_tiny_cpu_policy() -> None:
     assert metadata["num_rollout"] == 2
     assert metadata["num_pruned_rollout"] == 2
     assert metadata["mean_reward"] == pytest.approx(0.5)
+    assert metadata["pass@1"] == pytest.approx(0.5)
+    assert metadata["pass@group_size"] == pytest.approx(1.0)
     assert any(
         not torch.equal(before, after)
         for before, after in zip(parameters_before, model.parameters())

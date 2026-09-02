@@ -345,9 +345,9 @@ for step in range(num_rollout_steps):
         train_seconds = time.time() - train_start_time
         #train finish
         #log metrics
-        train_rewards = metadata["train_rewards"]
-        train_rewards_total = train_rewards[0].item() # type: ignore
-        train_rewards_format = train_rewards[1].item() # type: ignore
+        train_rewards_total = metadata.get("total_reward", 0.0)
+        train_rewards_format = metadata.get("total_format_reward", 0.0)
+        train_rewards_answer = metadata.get("total_answer_reward", 0.0)
         train_avg_response_length = sum(len(r.split()) for r in rollout_responses) / len(rollout_responses) if rollout_responses else 0.0
 
         # C: 梯度裁剪触发率 (clip_grad_norm_ 返回裁剪前的 norm)
@@ -388,8 +388,12 @@ for step in range(num_rollout_steps):
             # A: 核心进展
             "train/loss": loss.item() if torch.is_tensor(loss) else loss,
             "train/reward_mean": metadata.get("mean_reward", 0.0),
+            "train/answer_reward_mean": metadata.get("mean_answer_reward", 0.0),
             "train/format_reward_mean": metadata.get("mean_format_reward", 0.0),
+            "train/pass@1": metadata.get("pass@1", 0.0),
+            "train/pass@group_size": metadata.get("pass@group_size", 0.0),
             "train/rewards_total": train_rewards_total,
+            "train/rewards_answer": train_rewards_answer,
             "train/rewards_format": train_rewards_format,
             # B: 裁剪可观测性
             "train/pruned_frac": metadata.get("pruned_frac", 0.0),

@@ -368,24 +368,54 @@ def compute_rollout_rewards(
     reward_fn: Callable[[str, str], dict[str, float]], 
     rollout_responses: list[str], 
     repeated_ground_truths: list[str], 
+    group_size: int | None = None,
     ) -> tuple[torch.Tensor, dict[str, float]]:
     raw_rewards = []
+    answer_rewards = []
     total_reward = 0.0
     mean_reward = 0.0
+    total_answer_reward = 0.0
+    mean_answer_reward = 0.0
     total_format_reward = 0.0
     mean_format_reward = 0.0
     for response,ground_truth in zip(rollout_responses,repeated_ground_truths):
         reward = reward_fn(response,ground_truth)
+        # The total reward is the optimization signal; answer reward is kept
+        # separate for accuracy/pass@k observability.
         raw_rewards.append(reward["reward"])
+        # Keep compatibility with custom legacy reward functions while the
+        # built-in grader always supplies the full reward schema.
+        answer_rewards.append(reward.get("answer_reward", reward["reward"]))
         total_format_reward +=reward["format_reward"]
     total_reward = sum(raw_rewards)
-    mean_reward = total_reward/len(rollout_responses)
-    mean_format_reward = total_format_reward/len(rollout_responses)
+    total_answer_reward = sum(answer_rewards)
+    if rollout_responses:
+        mean_reward = total_reward/len(rollout_responses)
+        mean_answer_reward = total_answer_reward/len(rollout_responses)
+        mean_format_reward = total_format_reward/len(rollout_responses)
+    pass_at_1 = (
+        sum(answer_reward > 0.0 for answer_reward in answer_rewards) / len(answer_rewards)
+        if answer_rewards
+        else 0.0
+    )
+    pass_at_group_size = 0.0
+    if (
+        answer_rewards
+        and group_size is not None
+        and group_size > 0
+        and len(answer_rewards) % group_size == 0
+    ):
+        grouped_answer_rewards = torch.tensor(answer_rewards).reshape(-1, group_size)
+        pass_at_group_size = (grouped_answer_rewards > 0.0).any(dim=-1).float().mean().item()
     metadata = {
         "total_reward":total_reward,
         "mean_reward":mean_reward,
+        "total_answer_reward":total_answer_reward,
+        "mean_answer_reward":mean_answer_reward,
         "total_format_reward":total_format_reward,
         "mean_format_reward":mean_format_reward,
+        "pass@1":pass_at_1,
+        "pass@group_size":pass_at_group_size,
     }
     raw_rewards = torch.tensor(raw_rewards)
     return (raw_rewards,metadata)
@@ -533,11 +563,16 @@ def grpo_train_step(
         "loss":torch.zeros(1).to(device),
         "gradient_norm":0.0,
         "token_entropy":0.0,
-        "train_rewards":torch.zeros(2),
         "total_valid_tokens":0.0,
         # A: 核心进展 (按 rollout 数归一化, 跨配置可比)
+        "total_reward":0.0,
+        "total_answer_reward":0.0,
+        "total_format_reward":0.0,
         "mean_reward":0.0,
+        "mean_answer_reward":0.0,
         "mean_format_reward":0.0,
+        "pass@1":0.0,
+        "pass@group_size":0.0,
         # B: 裁剪可观测性
         "num_rollout":0,
         "num_pruned_rollout":0,
@@ -567,15 +602,20 @@ def grpo_train_step(
     raw_rewards,raw_rewards_metadata = compute_rollout_rewards(
                 reward_fn=reward_fn,
                 rollout_responses=rollout_responses,
-                repeated_ground_truths=repeated_ground_truths
+                repeated_ground_truths=repeated_ground_truths,
+                group_size=group_size,
                 )
     
     total_rewards = raw_rewards_metadata["total_reward"]
     total_format_rewards = raw_rewards_metadata["total_format_reward"]
-    metadata["train_rewards"][0]+=total_rewards
-    metadata["train_rewards"][1]+=total_format_rewards
+    metadata["total_reward"] = total_rewards
+    metadata["total_answer_reward"] = raw_rewards_metadata["total_answer_reward"]
+    metadata["total_format_reward"] = total_format_rewards
     metadata["mean_reward"] = raw_rewards_metadata["mean_reward"]
+    metadata["mean_answer_reward"] = raw_rewards_metadata["mean_answer_reward"]
     metadata["mean_format_reward"] = raw_rewards_metadata["mean_format_reward"]
+    metadata["pass@1"] = raw_rewards_metadata["pass@1"]
+    metadata["pass@group_size"] = raw_rewards_metadata["pass@group_size"]
 
     # B: 组级退化统计 (与 baseline 取值无关, 始终按 group_size 分组统计)
     grouped_for_stats = raw_rewards.reshape(-1,group_size)
@@ -697,10 +737,12 @@ def grpo_train_step(
         loss.backward()
         
         metadata["loss"]+=loss.detach()
+
     if max_grad_norm:
         total_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
     else:
         total_norm = 0.0
+
     metadata["gradient_norm"] = total_norm
     if metadata["total_valid_tokens"] > 0:
         metadata["token_entropy"] = metadata["token_entropy"] / metadata["total_valid_tokens"]
